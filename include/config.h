@@ -97,6 +97,20 @@
 #define DEVICE_MODEL  "seeed_esp32s3"
 #define PIN_INTERRUPT 0 // the boot button on the XIAO ESP32-S3, this button works as regular wakeup button
 #define FAKE_BATTERY_VOLTAGE
+#elif defined(BOARD_WAVESHARE_PHOTOPAINTER)
+#define DEVICE_MODEL      "waveshare_photopainter"
+#define PIN_INTERRUPT     0 // BOOT button
+#define PHOTO_PAINTER_I2C_PORT 0
+#define PHOTO_PAINTER_I2C_SDA 47
+#define PHOTO_PAINTER_I2C_SCL 48
+#define PHOTO_PAINTER_PMIC_SDA PHOTO_PAINTER_I2C_SDA
+#define PHOTO_PAINTER_PMIC_SCL PHOTO_PAINTER_I2C_SCL
+#define PHOTO_PAINTER_PMIC_ADDR 0x34
+#define PHOTO_PAINTER_PMIC_IRQ 21
+#define PHOTO_PAINTER_CHARGER_LED 3
+#define PHOTO_PAINTER_PWR_BUTTON 5
+#define PHOTO_PAINTER_KEY_BUTTON 4
+#define PHOTO_PAINTER_BUTTON_MASK ((1ULL << PIN_INTERRUPT) | (1ULL << PHOTO_PAINTER_PWR_BUTTON) | (1ULL << PHOTO_PAINTER_KEY_BUTTON))
 #endif
 
 // DHCP hostname prefix (hyphens instead of spaces).

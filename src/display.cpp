@@ -53,6 +53,7 @@ const TRMNL_DEVICE device_list[] =
   "xteink_x3",     8,    10,    21,  5,    4,   6,    20,   0,    3,     0xff, 0xff,    BATT_BQ27220,  EPD_368,
   "waveshare",     13,   14,    15,  26,   27,  25,   0xff, 0xff, 33,    0xff, 0xff,    BATT_ADC,  EPD_75,
   "waveshare_397", 11,   12,    10,  46,   9,   3,    41,   42,   0,     0xff, 0xff,    BATT_AXP2101,  EPD_397,
+  "waveshare_photopainter", 10, 11, 9, 12, 8,   13,   0xff, 0xff, 0,     0xff, 0xff,    BATT_AXP2101,  EPD_75_6CLR, // AXP2101 I2C is handled in axp2101.cpp
   "seeed_sticky",  13,   14,    15,  17,   16,  18,   1,    0,    4,     0xff, 0xff,    BATT_BQ27220,  EPD_397,  
   "seeed_esp32c3", 8,    10,    3,   2,    5,   4,    0xff, 0xff, 9,     0xff, 0xff,    BATT_ADC,  EPD_75,
   "seeed_esp32s3", 7,    9,     2,   1,    4,   3,    0xff, 0xff, 0,     0xff, 0xff,    BATT_ADC,  EPD_75,
@@ -137,6 +138,293 @@ extern BQ27427 lipo; // Use lipo.[] to interact with the library in an Arduino
 #include "fonts/Roboto_Black_24.h"
 #include <globals.h>
 static uint8_t *pDither;
+
+#if defined(BOARD_SEEED_RETERMINAL_E1002) || defined(BOARD_WAVESHARE_PHOTOPAINTER)
+#include "config.h"
+#include "bb_epaper.h"
+#include "driver/gpio.h"
+#include "driver/spi_master.h"
+#include "esp_err.h"
+
+#if defined(BOARD_WAVESHARE_PHOTOPAINTER)
+#define SPECTRA6_SPI_HOST SPI3_HOST
+#else
+#define SPECTRA6_SPI_HOST SPI2_HOST
+#endif
+
+extern BBEPAPER bbep;
+
+#if defined(BOARD_WAVESHARE_PHOTOPAINTER)
+static uint8_t *spectra6Framebuffer = nullptr;
+#endif
+
+static spi_device_handle_t spectra6Spi = nullptr;
+
+static bool spectra6_wait_busy(const char *label) {
+  uint32_t start_ms = millis();
+  
+  // 1. Wait up to 500ms for the controller to assert BUSY LOW (active busy)
+  uint32_t assert_count = 0;
+  while (gpio_get_level((gpio_num_t)pDevice->epd_busy_pin) == 1 && assert_count < 50) {
+    delay(10);
+    assert_count++;
+  }
+
+  // 2. Now wait while BUSY is LOW until it goes HIGH (ready / idle)
+  uint32_t wait_count = 0;
+  while (gpio_get_level((gpio_num_t)pDevice->epd_busy_pin) == 0) {
+    delay(50);
+    if (++wait_count > 800) { // Up to 40 seconds
+      Serial.printf("[Spectra6] BUSY timeout on '%s' after %lu ms\r\n", label, millis() - start_ms);
+      Log_error("spectra6 %s BUSY timeout (%lu ms)", label, millis() - start_ms);
+      return false;
+    }
+  }
+
+  Serial.printf("[Spectra6] BUSY ready on '%s' (took %lu ms)\r\n", label, millis() - start_ms);
+  return true;
+}
+
+// Send a single byte via SPI (for both command and data)
+static bool spectra6_spi_write_byte(uint8_t byte) {
+  spi_transaction_t transaction = {0};
+  transaction.length = 8;
+  transaction.tx_buffer = &byte;
+  return spi_device_polling_transmit(spectra6Spi, &transaction) == ESP_OK;
+}
+
+static bool spectra6_command(uint8_t cmd) {
+  if (!spectra6Spi) return false;
+  
+  gpio_set_level((gpio_num_t)pDevice->epd_dc_pin, 0);
+  gpio_set_level((gpio_num_t)pDevice->epd_cs_pin, 0);
+  
+  bool ok = spectra6_spi_write_byte(cmd);
+  
+  gpio_set_level((gpio_num_t)pDevice->epd_cs_pin, 1);
+  return ok;
+}
+
+static bool spectra6_data(uint8_t data) {
+  if (!spectra6Spi) return false;
+  
+  gpio_set_level((gpio_num_t)pDevice->epd_dc_pin, 1);
+  gpio_set_level((gpio_num_t)pDevice->epd_cs_pin, 0);
+  
+  bool ok = spectra6_spi_write_byte(data);
+  
+  gpio_set_level((gpio_num_t)pDevice->epd_cs_pin, 1);
+  return ok;
+}
+
+static bool spectra6_command_data(uint8_t cmd, const uint8_t *data, size_t len) {
+  if (!spectra6Spi) return false;
+
+  if (!spectra6_command(cmd)) return false;
+  
+  if (data && len) {
+    for (size_t i = 0; i < len; i++) {
+      if (!spectra6_data(data[i])) return false;
+    }
+  }
+
+  return true;
+}
+
+static bool spectra6_send_buffer(const uint8_t *data, size_t len) {
+  if (!spectra6Spi) return false;
+
+  gpio_set_level((gpio_num_t)pDevice->epd_dc_pin, 1);
+  gpio_set_level((gpio_num_t)pDevice->epd_cs_pin, 0);
+
+  const uint8_t *cursor = data;
+  size_t remaining = len;
+
+  while (remaining) {
+    size_t chunk_size = (remaining > 5000) ? 5000 : remaining;
+    
+    spi_transaction_t transaction = {0};
+    transaction.length = chunk_size * 8;
+    transaction.tx_buffer = cursor;
+    
+    if (spi_device_polling_transmit(spectra6Spi, &transaction) != ESP_OK) {
+      gpio_set_level((gpio_num_t)pDevice->epd_cs_pin, 1);
+      return false;
+    }
+
+    cursor += chunk_size;
+    remaining -= chunk_size;
+  }
+
+  gpio_set_level((gpio_num_t)pDevice->epd_cs_pin, 1);
+  return true;
+}
+
+static void spectra6_reset_panel() {
+  Serial.println("[Spectra6] Hardware reset panel...");
+  gpio_set_level((gpio_num_t)pDevice->epd_rst_pin, 1);
+  delay(50);
+  gpio_set_level((gpio_num_t)pDevice->epd_rst_pin, 0);
+  delay(20);
+  gpio_set_level((gpio_num_t)pDevice->epd_rst_pin, 1);
+  delay(50);
+}
+
+// Generate a deterministic 6-color vertical bar test pattern: White, Black, Yellow, Red, Blue, Green
+void spectra6_fill_test_pattern(uint8_t *buffer) {
+  static const uint8_t bar_colors[6] = {1, 0, 2, 3, 5, 6}; // E6 color values
+  for (int y = 0; y < 480; y++) {
+    for (int x = 0; x < 800; x += 2) {
+      int bar0 = (x * 6) / 800;
+      int bar1 = ((x + 1) * 6) / 800;
+      uint8_t c0 = bar_colors[bar0 < 6 ? bar0 : 5];
+      uint8_t c1 = bar_colors[bar1 < 6 ? bar1 : 5];
+      buffer[(y * 400) + (x / 2)] = (c0 << 4) | c1;
+    }
+  }
+}
+
+bool spectra6_render_1bpp_bitmap(const uint8_t *bitmap) {
+  // The Spectra 6 framebuffer format differs from the raw 1-bpp source, so we
+  // unpack it pixel by pixel via drawPixel rather than pointing at it directly.
+  // `bitmap` points at the pixel rows (BMP header already skipped by the caller).
+  if (!bbep.getBuffer()) {
+    Log_info("spectra6 framebuffer allocation start");
+    if (bbep.allocBuffer() != BBEP_SUCCESS) {
+      Log_error("spectra6 framebuffer allocation failed");
+      return false;
+    }
+    Log_info("spectra6 framebuffer allocation complete");
+  }
+
+  for (int y = 0; y < bbep.height(); y++) {
+    const uint8_t *row = bitmap + (y * ((bbep.width() + 7) / 8));
+    for (int x = 0; x < bbep.width(); x++) {
+      const uint8_t bit = row[x >> 3] & (0x80 >> (x & 7)); // MSB-first, set = white
+      bbep.drawPixel(x, y, bit ? BBEP_WHITE : BBEP_BLACK);
+    }
+  }
+  Log_info("spectra6 bitmap conversion complete");
+  return true;
+}
+
+bool spectra6_update() {
+  Serial.println("[Spectra6] === Starting spectra6_update ===");
+  Log_info("spectra6_update start");
+
+  if (!spectra6Spi) {
+    // Initialize GPIO pins for EPD control
+    gpio_config_t output_config = {};
+    output_config.pin_bit_mask = (1ULL << pDevice->epd_rst_pin) | (1ULL << pDevice->epd_dc_pin) | (1ULL << pDevice->epd_cs_pin);
+    output_config.mode = GPIO_MODE_OUTPUT;
+    output_config.pull_up_en = GPIO_PULLUP_ENABLE;
+    gpio_config(&output_config);
+
+    gpio_config_t input_config = {};
+    input_config.pin_bit_mask = (1ULL << pDevice->epd_busy_pin);
+    input_config.mode = GPIO_MODE_INPUT;
+    input_config.pull_up_en = GPIO_PULLUP_ENABLE;
+    gpio_config(&input_config);
+
+    spi_bus_config_t bus_config = {0};
+    bus_config.mosi_io_num = pDevice->epd_mosi_pin;
+    bus_config.miso_io_num = -1;
+    bus_config.sclk_io_num = pDevice->epd_sck_pin;
+    bus_config.quadwp_io_num = -1;
+    bus_config.quadhd_io_num = -1;
+    bus_config.max_transfer_sz = 800 * 480;
+
+    esp_err_t err = spi_bus_initialize(SPECTRA6_SPI_HOST, &bus_config, SPI_DMA_CH_AUTO);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+      Log_error("spectra6 spi_bus_initialize failed: %s", esp_err_to_name(err));
+      return false;
+    }
+
+    spi_device_interface_config_t device_config = {0};
+    device_config.clock_speed_hz = 10 * 1000 * 1000;
+    device_config.mode = 0;
+    device_config.spics_io_num = -1;
+    device_config.queue_size = 7;
+    device_config.flags = SPI_DEVICE_HALFDUPLEX;
+
+    err = spi_bus_add_device(SPECTRA6_SPI_HOST, &device_config, &spectra6Spi);
+    if (err != ESP_OK) {
+      Log_error("spectra6 spi_bus_add_device failed: %s", esp_err_to_name(err));
+      spectra6Spi = nullptr;
+      return false;
+    }
+
+    Serial.println("[Spectra6] SPI bus initialized at 10MHz");
+    Log_info("spectra6 SPI initialized");
+  }
+
+  spectra6_reset_panel();
+  if (!spectra6_wait_busy("reset")) return false;
+  delay(50);
+
+  const uint8_t cmd_h[] = {0x49, 0x55, 0x20, 0x08, 0x09, 0x18};
+  const uint8_t pwr[] = {0x3f};
+  const uint8_t psr[] = {0x5f, 0x69};
+  const uint8_t pfs[] = {0x00, 0x54, 0x00, 0x44};
+  const uint8_t btst1[] = {0x40, 0x1f, 0x1f, 0x2c};
+  const uint8_t btst2[] = {0x6f, 0x1f, 0x17, 0x49};
+  const uint8_t btst3[] = {0x6f, 0x1f, 0x1f, 0x22};
+  const uint8_t pll[] = {0x03};
+  const uint8_t cdi[] = {0x3f};
+  const uint8_t tcon[] = {0x02, 0x00};
+  const uint8_t tres[] = {0x03, 0x20, 0x01, 0xe0};
+  const uint8_t tvdcs[] = {0x01};
+  const uint8_t pws[] = {0x2f};
+
+  Serial.println("[Spectra6] Sending E6 register initialization sequence...");
+  if (!spectra6_command_data(0xaa, cmd_h, sizeof(cmd_h))) return false;
+  if (!spectra6_command_data(0x01, pwr, sizeof(pwr))) return false;
+  if (!spectra6_command_data(0x00, psr, sizeof(psr))) return false;
+  if (!spectra6_command_data(0x03, pfs, sizeof(pfs))) return false;
+  if (!spectra6_command_data(0x05, btst1, sizeof(btst1))) return false;
+  if (!spectra6_command_data(0x06, btst2, sizeof(btst2))) return false;
+  if (!spectra6_command_data(0x08, btst3, sizeof(btst3))) return false;
+  if (!spectra6_command_data(0x30, pll, sizeof(pll))) return false;
+  if (!spectra6_command_data(0x50, cdi, sizeof(cdi))) return false;
+  if (!spectra6_command_data(0x60, tcon, sizeof(tcon))) return false;
+  if (!spectra6_command_data(0x61, tres, sizeof(tres))) return false;
+  if (!spectra6_command_data(0x84, tvdcs, sizeof(tvdcs))) return false;
+  if (!spectra6_command_data(0xe3, pws, sizeof(pws))) return false;
+
+  // Power on and wait busy at end of initialization (matches reference EPD_Init)
+  Serial.println("[Spectra6] Sending CMD 0x04 (Init Power On)...");
+  if (!spectra6_command(0x04)) return false;
+  if (!spectra6_wait_busy("init power on")) return false;
+
+  // Framebuffer transmission
+  Serial.println("[Spectra6] Sending CMD 0x10 (Data transmission)...");
+  if (!spectra6_command(0x10)) return false;
+  
+  uint8_t *framebuffer = (uint8_t *)bbep.getBuffer();
+  if (framebuffer) {
+    Serial.printf("[Spectra6] Transmitting 192KB active framebuffer (sample: 0x%02X 0x%02X 0x%02X 0x%02X)...\r\n",
+                  framebuffer[0], framebuffer[1], framebuffer[2], framebuffer[3]);
+    if (!spectra6_send_buffer(framebuffer, 800 * 480 / 2)) return false;
+  } else {
+    Log_error("spectra6: no framebuffer available");
+    return false;
+  }
+
+  // Send CMD 0x12 (Refresh Display)
+  Serial.println("[Spectra6] Sending CMD 0x12 (Refresh Display)...");
+  if (!spectra6_command(0x12)) return false;
+  if (!spectra6_wait_busy("refresh")) return false;
+
+  // Power off
+  Serial.println("[Spectra6] Sending CMD 0x02 (Power Off)...");
+  if (!spectra6_command(0x02)) return false;
+  if (!spectra6_wait_busy("power off")) return false;
+
+  Serial.println("[Spectra6] === spectra6_update complete ===");
+  Log_info("spectra6_update complete");
+  return true;
+}
+#endif // defined(BOARD_SEEED_RETERMINAL_E1002) || defined(BOARD_WAVESHARE_PHOTOPAINTER)
 
 #ifdef BB_EPAPER
 static bool display_update_epaper(int refreshMode, bool wait, bool writePlane = false, uint8_t plane = PLANE_0)

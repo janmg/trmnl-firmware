@@ -10,6 +10,8 @@ void pins_init(void) {
   io_conf.mode = GPIO_MODE_INPUT;
 #ifdef BOARD_TRMNL_X
   io_conf.pin_bit_mask = (1ULL << PIN_INTERRUPT);
+#elif defined(BOARD_WAVESHARE_PHOTOPAINTER)
+  io_conf.pin_bit_mask = PHOTO_PAINTER_BUTTON_MASK;
 #else
   io_conf.pin_bit_mask = (1ULL << pDevice->interrupt_pin);
 #endif

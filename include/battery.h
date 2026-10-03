@@ -9,6 +9,8 @@
 //
 #if defined(BOARD_TRMNL_X)
 #define INCLUDE_BQ27427
+#elif defined(BOARD_WAVESHARE_PHOTOPAINTER)
+#define INCLUDE_AXP2101
 #endif
 
 /// @brief Abstract battery voltage source.
@@ -75,9 +77,20 @@ private:
 };
 #endif // INCLUDE_BQ27427
 
+#ifdef INCLUDE_AXP2101
+/// @brief Reads battery voltage from the Waveshare PhotoPainter AXP2101 PMIC.
+class AXP2101Battery : public BaseBattery {
+public:
+  float readVoltage(TRMNL_DEVICE *pDevice) override { return 0.0f; }
+  float readVoltage() override;
+};
+#endif // INCLUDE_AXP2101
+
 /// @brief Battery instance for the running board, selected at compile time.
 #ifdef INCLUDE_BQ27427
 BQ27427Battery &battery();
+#elif defined(INCLUDE_AXP2101)
+AXP2101Battery &battery();
 #else
 BaseBattery &battery();
 #endif

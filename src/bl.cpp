@@ -5,6 +5,7 @@
 #include <wifi_network.h>
 #include <power.h>
 #include <config.h>
+#include <axp2101.h>
 #include <battery.h>
 #include <device_id.h>
 #include <trmnl_log.h>
@@ -699,6 +700,12 @@ void bl_init(void)
   Log.begin(LOG_LEVEL_VERBOSE, &Serial);
 #endif
   Log_info("BL init success");
+#ifdef BOARD_WAVESHARE_PHOTOPAINTER
+  // The AXP2101 powers the e-paper panel and peripheral rails; configure it before touching the display
+  if (!axp2101().initialize()) {
+    Log_error("AXP2101 initialization failed");
+  }
+#endif
 
   WifiCaptivePortal.setHostname(getWifiClientHostname());
 

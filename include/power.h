@@ -10,6 +10,8 @@
 #define INCLUDE_TCA9535_POWER
 #elif defined(BOARD_TRMNL_GEN2)
 #define INCLUDE_GPIO_POWER
+#elif defined(BOARD_WAVESHARE_PHOTOPAINTER)
+#define INCLUDE_AXP2101_POWER
 #endif
 
 /// @brief USB/charger status source. The base class reports UNKNOWN, for
@@ -56,6 +58,15 @@ private:
   uint8_t _statPin;
 };
 #endif // INCLUDE_TCA9535_POWER
+
+#ifdef INCLUDE_AXP2101_POWER
+/// @brief Reads charger status from the Waveshare PhotoPainter AXP2101 PMIC.
+class AXP2101Power : public BasePower {
+public:
+  UsbStatus usbStatus() override;
+  ChargingStatus chargingStatus() override;
+};
+#endif // INCLUDE_AXP2101_POWER
 
 /// @brief Power status source for the running board, selected at compile time.
 BasePower &power();
